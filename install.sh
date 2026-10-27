@@ -4,6 +4,7 @@
 #   ./install.sh                 install / upgrade (starts on login)
 #   ./install.sh --no-autostart  install / upgrade without the login autostart
 #                                entry (removes one left by an earlier install)
+#   ./install.sh --force         install even though PySide6 is not importable
 #   ./install.sh --uninstall     remove everything install.sh installed
 set -euo pipefail
 
@@ -11,12 +12,14 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 AUTOSTART=1
+FORCE=0
 UNINSTALL=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-autostart) AUTOSTART=0; shift ;;
+        --force) FORCE=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
-        -h|--help) sed -n '2,7p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,8p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -45,22 +48,44 @@ TARGET_LAUNCHER="$DATA_HOME/applications/nosleep.desktop"
 TARGET_AUTOSTART="$CONFIG_HOME/autostart/nosleep.desktop"
 SETTINGS_DIR="$CONFIG_HOME/nosleep"
 
-# PIDs of this user's running nosleep, matched on the exact installed path
-# (argv[1] of "python3 <path>"), so nothing else with a similar name is hit.
+# PIDs of this user's running nosleep: the shebang runs it as
+# "python3 <installed path>", so a process counts only when its program
+# (argv[0]) is python3* and argv[1] is exactly the installed path. pgrep only
+# pre-filters on the literal word; the path is compared as a string, never as
+# a regex, so an editor or pager holding the file is never matched.
 running_pids() {
     local pid
-    for pid in $(pgrep -u "$(id -u)" -f -- "$TARGET_BIN" 2>/dev/null || true); do
-        if [[ "$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 2p)" == "$TARGET_BIN" ]]; then
+    local -a argv
+    for pid in $(pgrep -u "$(id -u)" -f nosleep 2>/dev/null || true); do
+        argv=()
+        mapfile -d '' -t argv 2>/dev/null < "/proc/$pid/cmdline" || continue
+        [[ ${#argv[@]} -ge 2 ]] || continue
+        if [[ "${argv[0]##*/}" == python3* && "${argv[1]}" == "$TARGET_BIN" ]]; then
             echo "$pid"
         fi
     done
 }
 
+# The Exec value for TARGET_BIN: one quoted argument, escaped per the Desktop
+# Entry spec. Inside the quotes ", `, $ and \ take a backslash; readers undo
+# string escapes before parsing Exec, so every backslash is then doubled; a
+# literal % is written %%.
+desktop_exec_value() {
+    local s="$TARGET_BIN"
+    s=${s//'\'/'\\'}
+    s=${s//'"'/'\"'}
+    s=${s//'`'/'\`'}
+    s=${s//'$'/'\$'}
+    s=${s//'\'/'\\'}
+    s=${s//'%'/'%%'}
+    printf '"%s"' "$s"
+}
+
 # Desktop entries carry an absolute Exec, as the app's own autostart writer
 # does: ~/.local/bin is often not on the session or systemd --user PATH.
 render_desktop() {  # template dest
-    local exec_value="$TARGET_BIN" text
-    [[ "$exec_value" =~ [[:space:]] ]] && exec_value="\"$exec_value\""
+    local exec_value text
+    exec_value="$(desktop_exec_value)"
     text="$(<"$1")"
     text="${text//@NOSLEEP_BIN@/"$exec_value"}"
     install -Dm644 /dev/stdin "$2" <<< "$text"
@@ -84,13 +109,30 @@ lid_note() {
     fi
 }
 
+# Without PySide6 the app dies at import, and from autostart that failure is
+# invisible, so a missing PySide6 stops the install unless --force is given.
 check_dependencies() {
+    local problem=""
     if ! command -v python3 >/dev/null 2>&1; then
-        echo "Warning: python3 not found; nosleep needs Python 3 with PySide6." >&2
+        problem="python3 was not found"
     elif ! python3 -c 'import PySide6.QtWidgets, PySide6.QtSvg, PySide6.QtDBus' >/dev/null 2>&1; then
-        echo "Warning: PySide6 (QtWidgets, QtSvg, QtDBus) is not importable by python3." >&2
-        echo "         Arch/Manjaro: sudo pacman -S pyside6; elsewhere your distribution's" >&2
-        echo "         PySide6 packages, or: python3 -m pip install --user PySide6" >&2
+        problem="PySide6 (QtWidgets, QtSvg, QtDBus) is not importable by python3"
+    fi
+    if [[ -n "$problem" ]]; then
+        if [[ $FORCE == 1 ]]; then
+            echo "Warning: $problem; installing anyway (--force)." >&2
+            echo "         nosleep will not start until PySide6 is installed." >&2
+        else
+            {
+                echo "Error: $problem, so nosleep cannot start. Nothing was installed."
+                echo "Install PySide6 first, then re-run ./install.sh:"
+                echo "  Arch/Manjaro: sudo pacman -S --needed pyside6"
+                echo "  elsewhere:    your distribution's PySide6 packages, or"
+                echo "                python3 -m pip install --user PySide6"
+                echo "Or re-run with --force to install anyway."
+            } >&2
+            exit 3
+        fi
     fi
     local tool
     for tool in kreadconfig6 kwriteconfig6; do

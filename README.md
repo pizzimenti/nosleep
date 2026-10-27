@@ -30,18 +30,24 @@ nosleep changes one thing: the action PowerDevil takes when you close the lid.
 
 - KDE Plasma 6 with PowerDevil (verified on Plasma 6.6, Wayland)
 - `kreadconfig6` and `kwriteconfig6` (KDE Frameworks 6 KConfig; installed with Plasma)
-- Python 3 with PySide6 (QtWidgets, QtSvg, QtDBus). Arch/Manjaro: `pyside6`;
-  elsewhere your distribution's PySide6 packages or `python3 -m pip install --user PySide6`
+- Python 3 with PySide6 (QtWidgets, QtSvg, QtDBus). A stock Manjaro or Arch KDE
+  install does not include it: `sudo pacman -S --needed pyside6`. Elsewhere,
+  your distribution's PySide6 packages or `python3 -m pip install --user PySide6`
 - A system tray (Plasma's is fine)
 
-No root: everything installs into your home directory.
+No root for nosleep itself: everything installs into your home directory.
 
 ## Install
 
 ```bash
+sudo pacman -S --needed pyside6        # Arch/Manjaro; see Requirements otherwise
 git clone https://github.com/pizzimenti/nosleep.git && cd nosleep
 ./install.sh
 ```
+
+If PySide6 is not importable, `install.sh` stops with exit 3 and installs
+nothing, because the app would otherwise fail silently at every login.
+`--force` installs anyway.
 
 The installer (per user, idempotent; re-run it to upgrade):
 
@@ -53,8 +59,9 @@ The installer (per user, idempotent; re-run it to upgrade):
 | `~/.config/autostart/nosleep.desktop` | Starts it on login |
 
 `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` replace `~/.local/share` and `~/.config`
-when set. The desktop entries run the app by its absolute path, so it starts
-even when `~/.local/bin` is not on the session's `PATH`.
+when set. The desktop entries run the app by its absolute path (quoted and
+escaped per the Desktop Entry spec), so it starts even when `~/.local/bin` is
+not on the session's `PATH`.
 
 It does not start the app; launch *NoSleep* from the menu, or log out and in.
 If an older version is running, quit it from its tray menu and start it again.
@@ -63,8 +70,12 @@ Options:
 
 ```bash
 ./install.sh --no-autostart   # install / upgrade without starting on login
+./install.sh --force          # install even though PySide6 is missing
 ./install.sh --uninstall      # remove the four files above
 ```
+
+The installer refuses to run as root (under `sudo` it would install into
+root's home).
 
 The *Start on login* menu item writes and removes the same autostart entry, so
 it and `--no-autostart` agree. A plain re-install turns autostart back on.
@@ -75,7 +86,8 @@ it and `--no-autostart` agree. A plain re-install turns autostart back on.
 ./install.sh --uninstall
 ```
 
-This stops a running nosleep and removes exactly the four installed files. It
+This stops a running nosleep (only a `python3` process running exactly the
+installed file) and removes exactly the four installed files. It
 does not change your power settings: if the lid was set to stay awake, it stays
 that way (the uninstaller says so); set it back in System Settings > Power
 Management, or toggle nosleep off before uninstalling. The app's settings in
@@ -90,11 +102,23 @@ tests/check.sh
 
 Runs `bash -n` on every shell file, `shellcheck` when installed, a parse of the
 Python script (nothing is executed), and `tests/test_install.sh`, which installs
-into a throwaway `HOME` and checks the files, their modes and contents, the
-absolute `Exec` paths, idempotency, `--no-autostart`, XDG overrides, a `HOME`
-with a space, and that `--uninstall` returns the home to exactly its prior
-files (unrelated files, the app's settings and `powerdevilrc` untouched). The
-tests never run nosleep, so they are safe on any machine.
+into throwaway `HOME`s and checks:
+
+- the files, their modes and contents, and `desktop-file-validate` with no output
+- `Exec` decoding back to the installed path, including a `HOME` containing
+  `+`, `(`, `)`, `$`, `%`, a backtick, `"` and `\`, and one with a space
+- idempotency, `--no-autostart`, and the XDG overrides
+- `--uninstall` returning the home to exactly its prior files (unrelated files,
+  the app's settings and `powerdevilrc` untouched)
+- `--uninstall` stopping a stand-in "running nosleep" (`tail -f` renamed
+  `python3`) while a pager on the same file and `python3` on another file
+  keep running
+- the PySide6 refusal (exit 3, nothing written) and `--force`
+- refusal to run as root (via `unshare -r`, skipped where that is not permitted)
+
+The tests never run nosleep, so they are safe on any machine. A stand-in
+`python3` answers the PySide6 check, so they pass whether or not PySide6 is
+installed.
 
 ## License
 

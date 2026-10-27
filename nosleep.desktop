@@ -6,5 +6,6 @@ Comment=Keep the system awake when the laptop lid is closed (idle sleep unaffect
 Exec=@NOSLEEP_BIN@
 Icon=nosleep
 Terminal=false
-Categories=Utility;System;
+StartupNotify=false
+Categories=Utility;
 Keywords=lid;clamshell;sleep;suspend;awake;laptop;close;
