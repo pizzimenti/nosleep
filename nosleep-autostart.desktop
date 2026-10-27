@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NoSleep
+Comment=Keep the system awake when the laptop lid is closed
+Exec=@NOSLEEP_BIN@
+Icon=nosleep
+Terminal=false
+X-GNOME-Autostart-enabled=true
