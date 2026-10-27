@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""nosleep — keep KDE/Plasma awake *only* when the laptop lid is closed.
+
+This is deliberately orthogonal to everything else in KDE's power management:
+
+  * It does NOT touch idle/timer sleep — if your "Suspend session after N min"
+    timer (or any other trigger) fires, the machine still sleeps normally.
+  * It does NOT duplicate the battery widget's "Manually block sleep and
+    screen locking" toggle (that one blocks *idle* sleep + locking).
+
+The ONE thing it changes: the action PowerDevil takes when you close the lid.
+
+  * nosleep ON  -> lid-close action = "Do nothing"  (system stays awake)
+  * nosleep OFF -> lid-close action = your normal action (Sleep, restored)
+
+Mechanism (verified on Plasma 6.6 / Wayland): it writes `LidAction` in
+~/.config/powerdevilrc for the AC and Battery profiles via kwriteconfig6, then
+asks PowerDevil to reload with reparseConfiguration() + refreshStatus(). The
+state lives in PowerDevil's own config, so it persists across restarts and
+there is no lock to leak — the tray app is just a convenient toggle/indicator.
+
+LidAction enum (PowerDevil): 0=do nothing, 1=sleep, 2=hibernate, 8=shut down,
+32=lock screen, 64=turn off screen.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QSettings, QLockFile, QStandardPaths, QByteArray
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QAction
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+from PySide6.QtDBus import QDBusConnection, QDBusInterface, QDBusReply
+
+APP_ID = "nosleep"
+APP_NAME = "NoSleep"
+
+PROFILES = ("AC", "Battery")
+ACTION_DO_NOTHING = 0
+ACTION_SLEEP = 1  # PowerDevil's built-in default lid action
+
+PD_SERVICE = "org.kde.Solid.PowerManagement"
+PD_PATH = "/org/kde/Solid/PowerManagement"
+HBE_PATH = "/org/kde/Solid/PowerManagement/Actions/HandleButtonEvents"
+
+# Steaming cup = lid stays awake; empty cup = lid sleeps normally. Grey outline
+# stays visible on light or dark panels; amber fill stands out on dark ones.
+ICON_ON = """<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <g fill="none" stroke="#ff8a65" stroke-width="3.5" stroke-linecap="round">
+    <path d="M26 13c-4-3 4-6 0-10"/>
+    <path d="M37 13c-4-3 4-6 0-10"/>
+  </g>
+  <path d="M46 26h4a7 7 0 0 1 0 14h-4" fill="none" stroke="#3e2723" stroke-width="4" stroke-linecap="round"/>
+  <path d="M12 24h34v9a17 17 0 0 1-34 0z" fill="#6d4c41" stroke="#3e2723" stroke-width="2.5" stroke-linejoin="round"/>
+  <ellipse cx="29" cy="24" rx="17" ry="4" fill="#3e2723"/>
+</svg>"""
+
+ICON_OFF = """<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <path d="M46 26h4a7 7 0 0 1 0 14h-4" fill="none" stroke="#9e9e9e" stroke-width="4" stroke-linecap="round"/>
+  <path d="M12 24h34v9a17 17 0 0 1-34 0z" fill="none" stroke="#9e9e9e" stroke-width="3" stroke-linejoin="round"/>
+  <ellipse cx="29" cy="24" rx="17" ry="4" fill="none" stroke="#9e9e9e" stroke-width="2.5"/>
+</svg>"""
+
+
+def _render(svg_text, size):
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    renderer.render(painter)
+    painter.end()
+    return pm
+
+
+def make_icon(svg_text):
+    icon = QIcon()
+    for size in (22, 32, 48, 64, 128, 256):
+        icon.addPixmap(_render(svg_text, size))
+    return icon
+
+
+class LidControl:
+    """Reads/writes PowerDevil's lid-close action and reloads it live."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.bus = QDBusConnection.sessionBus()
+
+    def _pm(self):
+        return QDBusInterface(PD_SERVICE, PD_PATH, PD_SERVICE, self.bus)
+
+    def _hbe(self):
+        return QDBusInterface(
+            PD_SERVICE, HBE_PATH,
+            f"{PD_SERVICE}.Actions.HandleButtonEvents", self.bus,
+        )
+
+    def lid_present(self):
+        reply = QDBusReply(self._pm().call("isLidPresent"))
+        return bool(reply.value()) if reply.isValid() else True
+
+    def live_action(self):
+        """The lid action PowerDevil is actually using right now (or None)."""
+        reply = QDBusReply(self._hbe().call("lidAction"))
+        return int(reply.value()) if reply.isValid() else None
+
+    def _read(self, profile):
+        out = subprocess.run(
+            ["kreadconfig6", "--file", "powerdevilrc",
+             "--group", profile, "--group", "SuspendAndShutdown",
+             "--key", "LidAction"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        try:
+            return int(out)
+        except ValueError:
+            return ACTION_SLEEP  # key absent -> PowerDevil defaults to Sleep
+
+    def _write(self, profile, value):
+        subprocess.run(
+            ["kwriteconfig6", "--file", "powerdevilrc",
+             "--group", profile, "--group", "SuspendAndShutdown",
+             "--key", "LidAction", str(value)],
+            check=False,
+        )
+
+    def _reload(self):
+        pm = self._pm()
+        pm.call("reparseConfiguration")
+        pm.call("refreshStatus")
+
+    def is_active(self):
+        """True if the lid is currently set to keep the system awake."""
+        return self.live_action() == ACTION_DO_NOTHING
+
+    def enable(self):
+        for profile in PROFILES:
+            current = self._read(profile)
+            if current != ACTION_DO_NOTHING:
+                # Remember the user's real preference so we can restore it.
+                self.settings.setValue(f"restore_{profile}", current)
+            self._write(profile, ACTION_DO_NOTHING)
+        self._reload()
+
+    def disable(self):
+        for profile in PROFILES:
+            restore = self.settings.value(f"restore_{profile}", ACTION_SLEEP, type=int)
+            if restore == ACTION_DO_NOTHING:
+                restore = ACTION_SLEEP
+            self._write(profile, restore)
+        self._reload()
+
+
+class NoSleepTray:
+    def __init__(self, app):
+        self.app = app
+        self.settings = QSettings(APP_ID, APP_ID)
+        self.lid = LidControl(self.settings)
+
+        self.icon_on = make_icon(ICON_ON)
+        self.icon_off = make_icon(ICON_OFF)
+
+        self.tray = QSystemTrayIcon()
+        self.tray.activated.connect(self._on_activated)
+        self._build_menu()
+        self.tray.setContextMenu(self.menu)
+        self._refresh()
+        self.tray.show()
+
+    # ---- menu -----------------------------------------------------------
+    def _build_menu(self):
+        self.menu = QMenu()
+
+        self.status_action = self.menu.addAction("…")
+        self.status_action.setEnabled(False)
+        self.menu.addSeparator()
+
+        self.toggle_action = self.menu.addAction("Keep awake when lid closes")
+        self.toggle_action.setCheckable(True)
+        self.toggle_action.triggered.connect(self.toggle)
+
+        self.menu.addSeparator()
+
+        self.autostart_action = self.menu.addAction("Start on login")
+        self.autostart_action.setCheckable(True)
+        self.autostart_action.setChecked(self._autostart_enabled())
+        self.autostart_action.toggled.connect(self._set_autostart)
+
+        self.notify_action = self.menu.addAction("Show notifications")
+        self.notify_action.setCheckable(True)
+        self.notify_action.setChecked(self.settings.value("notify", True, type=bool))
+        self.notify_action.toggled.connect(
+            lambda checked: self.settings.setValue("notify", checked)
+        )
+
+        self.menu.addSeparator()
+        self.menu.addAction("About", self._about)
+        self.menu.addAction("Quit", self._quit)
+
+    # ---- state ----------------------------------------------------------
+    def _on_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.MiddleClick,
+        ):
+            self.toggle()
+
+    def toggle(self):
+        try:
+            if self.lid.is_active():
+                self.lid.disable()
+                changed_to = False
+            else:
+                self.lid.enable()
+                changed_to = True
+        except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+            self._error(f"Could not change the lid action:\n{exc}")
+            self._refresh()
+            return
+
+        self._refresh()
+        if self._notify():
+            if changed_to:
+                self.tray.showMessage(
+                    APP_NAME,
+                    "Closing the lid will NOT sleep the system.\n"
+                    "(Idle/timer sleep still works as normal.)",
+                    self.icon_on, 5000,
+                )
+            else:
+                self.tray.showMessage(
+                    APP_NAME,
+                    "Closing the lid will sleep the system again.",
+                    self.icon_off, 5000,
+                )
+
+    def _refresh(self):
+        active = self.lid.is_active()
+        self.toggle_action.setChecked(active)
+        if active:
+            self.tray.setIcon(self.icon_on)
+            self.status_action.setText("Lid close: staying awake")
+            self.tray.setToolTip(f"{APP_NAME}: lid close keeps the system awake")
+        else:
+            self.tray.setIcon(self.icon_off)
+            self.status_action.setText("Lid close: sleeps (normal)")
+            self.tray.setToolTip(f"{APP_NAME}: lid close sleeps normally")
+        if not self.lid.lid_present():
+            self.status_action.setText("No laptop lid detected")
+            self.tray.setToolTip(f"{APP_NAME}: no laptop lid detected")
+
+    # ---- helpers --------------------------------------------------------
+    def _notify(self):
+        return bool(self.settings.value("notify", True, type=bool))
+
+    def _error(self, text):
+        if self._notify():
+            self.tray.showMessage(APP_NAME, text, self.icon_off, 6000)
+        else:
+            print(f"{APP_NAME}: {text}", file=sys.stderr)
+
+    # ---- autostart ------------------------------------------------------
+    def _autostart_path(self):
+        config = Path(
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.GenericConfigLocation
+            )
+        )
+        return config / "autostart" / f"{APP_ID}.desktop"
+
+    def _autostart_enabled(self):
+        return self._autostart_path().exists()
+
+    def _set_autostart(self, enabled):
+        path = self._autostart_path()
+        if enabled:
+            import os
+            exec_path = os.path.realpath(sys.argv[0])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name={APP_NAME}\n"
+                "Comment=Keep the system awake when the laptop lid is closed\n"
+                f"Exec={exec_path}\n"
+                f"Icon={APP_ID}\n"
+                "Terminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n"
+            )
+        elif path.exists():
+            path.unlink()
+
+    # ---- misc -----------------------------------------------------------
+    def _about(self):
+        QMessageBox.information(
+            None,
+            f"About {APP_NAME}",
+            f"<b>{APP_NAME}</b> — keep the system awake when the lid is closed.<br><br>"
+            "Toggles PowerDevil's lid-close action between <i>Sleep</i> and "
+            "<i>Do nothing</i>. Idle/timer sleep and the battery widget's "
+            "“block sleep” toggle are unaffected — this only changes "
+            "what happens when you shut the lid.<br><br>"
+            "Left-click the tray icon to toggle.",
+        )
+
+    def _quit(self):
+        # Intentionally does NOT revert the lid setting: the state is a
+        # persistent PowerDevil preference, not a transient lock.
+        self.app.quit()
+
+
+def main():
+    QApplication.setApplicationName(APP_NAME)
+    QApplication.setOrganizationName(APP_ID)
+    QApplication.setApplicationDisplayName(APP_NAME)
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setDesktopFileName(APP_ID)
+
+    import os
+    lock_path = os.path.join(
+        QStandardPaths.writableLocation(QStandardPaths.StandardLocation.TempLocation),
+        f"{APP_ID}.lock",
+    )
+    global _lock
+    _lock = QLockFile(lock_path)
+    _lock.setStaleLockTime(0)
+    if not _lock.tryLock(100):
+        print(f"{APP_NAME} is already running.", file=sys.stderr)
+        return 0
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print(
+            f"{APP_NAME}: no system tray detected yet; "
+            "the icon will appear once the tray host is ready.",
+            file=sys.stderr,
+        )
+
+    tray = NoSleepTray(app)  # noqa: F841 (kept alive for the app lifetime)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
