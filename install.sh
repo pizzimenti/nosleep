@@ -72,11 +72,11 @@ running_pids() {
 # literal % is written %%.
 desktop_exec_value() {
     local s="$TARGET_BIN"
-    s=${s//'\'/'\\'}
+    s=${s//"\\"/"\\\\"}
     s=${s//'"'/'\"'}
     s=${s//'`'/'\`'}
     s=${s//'$'/'\$'}
-    s=${s//'\'/'\\'}
+    s=${s//"\\"/"\\\\"}
     s=${s//'%'/'%%'}
     printf '"%s"' "$s"
 }
